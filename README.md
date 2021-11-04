@@ -36,6 +36,8 @@ The system we developped has the following features :
 * Dedicated PCB board with some extension capacities (see board features for details)
 
 ### PCB board features
+<img src="/Images/SolarPanelOptimizerBoardView.jpg" width=300 align=right>
+
 * Arduino Nano based
 * Clean and user friendly design
 * Inputs
