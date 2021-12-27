@@ -17,22 +17,27 @@
 #include "PI.h"
 #include "ControlToolbox.h"
 
-/* ALIAS SONDES */
+/* PROBES ALIAS */
 #define PROBE_BOILER    CUR_SENSE1
 #define PROBE_MAIN      CUR_SENSE2
 #define PROBE_PANELS    CUR_SENSE3
 /**********/
 
-#define LCD_DEFAULT_ADDRESS		0x27
-#define LCD_CHARS_PER_LINE		16
-#define LCD_LINE_COUNT			2
-LiquidCrystal_I2C lcd(LCD_DEFAULT_ADDRESS, LCD_CHARS_PER_LINE, LCD_LINE_COUNT);	// LCD initialization
+#define LCD_DEFAULT_ADDRESS    0x27
+#define LCD_CHARS_PER_LINE    16
+#define LCD_LINE_COUNT      2
+LiquidCrystal_I2C lcd(LCD_DEFAULT_ADDRESS, LCD_CHARS_PER_LINE, LCD_LINE_COUNT); // LCD initialization
 
 /* Location data for sunset/sunrise determination. Customization : change it to your own location */
-#define LOCAL_LATTITUDE    	43.836699
-#define LOCAL_LONGITUDE   	4.360054
+#define LOCAL_LATTITUDE     43.836699
+#define LOCAL_LONGITUDE     4.360054
 #define LOCAL_TIMEZONE      GetTimezoneFranceFixe
 /**********/
+
+/* DEBUG stuff */
+int dayMins, dayHours, dayD, dayM;
+DateTime LastForcedHeatDate;
+/**************/
 
 /* RTC */
 RTC_PCF8523 rtc;
@@ -55,7 +60,7 @@ int emonAvgTmp[CUR_SENSE_COUNT];
 int AvgCount = 0;
 
 // Buttons
-#define MAX_DEBOUNCED_BUTTONS 	10
+#define MAX_DEBOUNCED_BUTTONS   10
 #define BUTTON_DEBOUNCE_TIME_MS    5
 DebouncedButton button1(IO1);
 DebouncedButton button2(IO2);
@@ -64,15 +69,15 @@ DebouncedButton button4(IO4);
 void ManageButtonsDebouncing();
 
 // Operating modes
-enum Modes { MODES_IDLE, MODES_DAY_HEAT, MODES_STARTING_NIGHT, MODES_TESTING_BOILER, MODES_NIGHT_HEAT, MODES_NIGHT_OFF };
+enum Modes { MODES_IDLE, MODES_DAY_HEAT, MODES_STARTING_FORCED_HEAT, MODES_TESTING_BOILER, MODES_FORCE_HEAT, MODES_OFF };
 enum Modes currentMode = MODES_IDLE;
 Modes ManageModes(Modes modeToManage);
 String CurrentModeStr = "";
 
-
 // Home hardware specific functions 
 bool IsBoilerON();
-#define MAX_BOILER_POWER    (4700.0)	// Customization : set your boiler max power rating in Watts
+#define MAX_BOILER_POWER          (4700.0)  // Customization : set your boiler max power rating in Watts
+#define BOILER_TESTING_DELAY_S    (10)      // Time in seconds to wait before testing if the boiler is consuming power or not
 
 // Control stuff
 unsigned long int dT = 0;
@@ -93,7 +98,7 @@ RateLimiter on_off_rate_lim((float)MAX_LED_INTENSITY / 3.0); // Rate limiter for
 
 Limiter lim_BoilerPowerCmd(0, MAX_BOILER_POWER);     // Limiter for the boiler power command (avoid sudden changes in the command)
 // PID controller to manage boiler power control
-RegPI pi(0.04, 0.000, 50);	// Notice : no Integral term
+RegPI pi(0.04, 0.000, 50);  // Notice : no Integral term
 
 
 // Application parameters
@@ -103,19 +108,42 @@ typedef struct
 }AppParameters;
 
 // Display menu definitions.
-enum Menus { MENU_OFF, MENU_1, MENU_2, MENU_3, MENU_PARAMETERS, MAX_MENU };
+enum Menus { MENU_OFF, MENU_1, MENU_2, MENU_3, MENU_4, MENU_PARAMETERS, MENU_FORCE_HEAT, MAX_MENU };
 enum Menus currentMenu = MENU_OFF;
 enum Menus ManageMenus( enum Menus menuToDisplay );
-#define MENUS_REFRESH_TIME_S  2   // Periode en s a laquelle on force le rafraichissement de l'ecran
-#define LCD_LINE(line_str, string, ...) snprintf(line_str, sizeof(line_str), string, ## __VA_ARGS__)  // Fonction d'aide pour definir ce qu'on affiche sur chaque ligne
+#define MENUS_REFRESH_TIME_S  2   // Force refreshing the LCD every ... seconds
+#define LCD_LINE_EX(line_str, line_size, string, ...) snprintf(line_str, line_size, string, ## __VA_ARGS__)  // Helper function for LCD text with extended parameters
+#define LCD_LINE(line_str, string, ...) LCD_LINE_EX(line_str, sizeof(line_str), string, ## __VA_ARGS__)  // Simplified helper function for LCD text
+
+
+typedef enum
+{
+  DVT_FLOAT,
+  DVT_DATE_TIME
+}DisplayableVariableType;
 
 typedef struct
 {
   char VarName[12];
-  float* VarPtr;
+  void* VarPtr;
   char Unit[4];
+  DisplayableVariableType Type;
 }DisplayableVariable;
-#define NEW_DISP_VAR(text_name, variable, unite)  {text_name, (float*)&variable, unite}
+#define NEW_DISP_VAR_DATE(text_name, variable)  {text_name, (void*)&variable, "", DVT_DATE_TIME}
+#define NEW_DISP_VAR(text_name, variable, unit)  {text_name, (void*)&variable, unit, DVT_FLOAT}
+
+void ComputeLCDText(char* line_str_out, DisplayableVariable displayableVar)
+{
+  switch(displayableVar.Type)
+  {
+    case DVT_DATE_TIME:
+      LCD_LINE_EX(line_str_out, LCD_CHARS_PER_LINE, "%s=%02d:%02d", displayableVar.VarName, (int)(((DateTime*)displayableVar.VarPtr)->month()), (int)(((DateTime*)displayableVar.VarPtr)->day()));
+    break;
+    default:
+      LCD_LINE_EX(line_str_out, LCD_CHARS_PER_LINE, "%s=%d%s", displayableVar.VarName, (int)(*((float*)displayableVar.VarPtr)), displayableVar.Unit);
+    break;
+  }
+}
 
 // Beware. The DisplayableVariable variables must be placed after the variables you want to display so that they are declared when initializing the menu variable
 
@@ -125,7 +153,8 @@ DisplayableVariable Menu1_Vars[] = {
   NEW_DISP_VAR("HeatPow", BoilerPower, "W"),
   NEW_DISP_VAR("PanelPow", PanelPower, "W"),
   NEW_DISP_VAR("BoilerCmd", BoilerPowerCmd, "W"),
-  NEW_DISP_VAR("Led", led_intensity, "")
+  NEW_DISP_VAR("Led", led_intensity, ""),
+  NEW_DISP_VAR_DATE("LastFHeat", LastForcedHeatDate)
 };
 
 // Creating a table for variables to display on menu "parameters"
@@ -242,7 +271,7 @@ void setup()
   currentMenu = MENU_1; // Starting with MENU_1
 
   #ifdef SERIAL_DEBUG
-  	Serial.println("MainPower;PanelPower;BoilerPower;intensite led");
+    Serial.println("MainPower;PanelPower;BoilerPower;intensite led");
   #endif
 }
 
@@ -256,18 +285,18 @@ void loop()
   unsigned long int curMillis = millis();
   dT = curMillis - prevDTmillis;
   prevDTmillis = curMillis;
-
+  
   // Update probe sensor measurements
   ManageEmons();
 
   // Serial output debug text
   #ifdef SERIAL_DEBUG
-	  Serial.print(MainPower);
-	  Serial.print(";");
-	  Serial.print(PanelPower);
-	  Serial.print(";");
-	  Serial.print(BoilerPower);
-	  Serial.print(";");
+    Serial.print(MainPower);
+    Serial.print(";");
+    Serial.print(PanelPower);
+    Serial.print(";");
+    Serial.print(BoilerPower);
+    Serial.print(";");
   #endif
   
   // Manage modes of operation
@@ -307,7 +336,7 @@ void loop()
 
   // Finish printing debug log data
   #ifdef SERIAL_DEBUG
-  	Serial.println(led_intensity);
+    Serial.println(led_intensity);
   #endif
 
   // Setting the led intensity (i.e. resulting from the control loop)
@@ -322,91 +351,104 @@ Modes ManageModes(Modes modeToManage)
   switch(modeToManage)
   {
     case MODES_DAY_HEAT :
-		// This Day heat mode is where we drive the boiler power so that it is using the panel power that would be sent outside to the network otherwise
+    // This Day heat mode is where we drive the boiler power so that it is using the panel power that would be sent outside to the network otherwise
 
-		CurrentModeStr = "DAY_HEAT";
+    CurrentModeStr = "DAY_HEAT";
 
-		// Calculating the amount of power to reach the TargetPower (the target) from the current MainPower value (power consumed by our house) and feeding this to our PID
-		pi.Update(PI_SETPOINT(TargetPower, MainPower), dT);
+    // Calculating the amount of power to reach the TargetPower (the target) from the current MainPower value (power consumed by our house) and feeding this to our PID
+    pi.Update(PI_SETPOINT(TargetPower, MainPower), dT);
 
-		// Getting the output of the previous step (the PID) and adding it to the current boiler power setpoint
-		BoilerPowerCmd += pi.GetOutput();
+    // Getting the output of the previous step (the PID) and adding it to the current boiler power setpoint
+    BoilerPowerCmd += pi.GetOutput();
 
-		// Limiting the new setpoint to the [0 MAX_BOILER_POWER] range (yeh... unfortunately, our boiler is not producing power !! and we cannot over power it)
-		BoilerPowerCmd = lim_BoilerPowerCmd.Update(BoilerPowerCmd);
+    // Limiting the new setpoint to the [0 MAX_BOILER_POWER] range (yeh... unfortunately, our boiler is not producing power !! and we cannot over power it)
+    BoilerPowerCmd = lim_BoilerPowerCmd.Update(BoilerPowerCmd);
 
-		// Applying the linear scaling to transform boiler power (Watts) into led intensity
-		led_intensity = (unsigned int)( (BoilerPowerCmd / MAX_BOILER_POWER) * (float)MAX_LED_INTENSITY );
+    // Applying the linear scaling to transform boiler power (Watts) into led intensity
+    led_intensity = (unsigned int)( (BoilerPowerCmd / MAX_BOILER_POWER) * (float)MAX_LED_INTENSITY );
 
     break;
-    case MODES_STARTING_NIGHT :
-		// This Starting night mode is a state in which we're just passing once to initialize stuff when leaving day mode and entering night mode
+    case MODES_STARTING_FORCED_HEAT :
+    // This Starting forced heat mode is a state in which we're just passing once to initialize stuff before making a forced heat (mostly when leaving day mode and entering night mode)
 
-		CurrentModeStr = "START_NIGHT";
+    CurrentModeStr = "START_F_HEAT";
 
-		// Resetting the boiler power setpoint to 0 for the next day
-		BoilerPowerCmd = 0.0;
+    // Resetting the boiler power setpoint to 0 for next time (mostly for the next day)
+    BoilerPowerCmd = 0.0;
 
-		// Setting the rate limiter to the current setpoint (i.e. led_intensity) so that the rate limiter is in sync with the current setpoint (i.e. avoid discontinuity in the setpoint)
-		on_off_rate_lim.SetCurrentState(led_intensity);
+    // Setting the rate limiter to the current setpoint (i.e. led_intensity) so that the rate limiter is in sync with the current setpoint (i.e. avoid discontinuity in the setpoint)
+    on_off_rate_lim.SetCurrentState(led_intensity);
 
-		// Moving on to the next step
-		newMode = MODES_TESTING_BOILER;
+    // Moving on to the next step
+    newMode = MODES_TESTING_BOILER;
     break;
     case MODES_TESTING_BOILER :
-		// The goal of this mode is to test if the boiler is hot enough (i.e. had enough time in the day to heat to its standard temperature)
+    // The goal of this mode is to test if the boiler is hot enough (i.e. had enough time in the day to heat to its standard temperature)
 
-		CurrentModeStr = "TEST_BOILER";
+    static unsigned long int heatTimeDelay = 0;
 
-		// Progressively powering the boiler using the rate limiter to gently increase the setpoint
-		on_off_rate_lim.Update((float)MAX_LED_INTENSITY, dT);
-		led_intensity = on_off_rate_lim.GetOutput();
+    CurrentModeStr = "TEST_BOILER";
 
-		// Waiting for the setpoint to reach a rather high value (i.e. nearly 100% ON)
-		if(led_intensity >= (MAX_LED_INTENSITY * 0.9))
-		{
-			// If the boiler is consuming power...
-			if ( IsBoilerON() )        // il chauffe => pas assez chauffé en journée
-			{
-			  // It means it did not reach the desired temperature so we need to power it during the night for heating up
-			  newMode = MODES_NIGHT_HEAT;
-			}
-			else 
-			{
-			  // Otherwise we had enough sun during the day to get the required temperature in the boiler, so switching everything off for the whole night !
-			  newMode = MODES_NIGHT_OFF;
-			}
-		}
+    // Progressively powering the boiler using the rate limiter to gently increase the setpoint
+    on_off_rate_lim.Update((float)MAX_LED_INTENSITY, dT);
+    led_intensity = on_off_rate_lim.GetOutput();
+
+    // Waiting for the setpoint to reach a rather high value (i.e. nearly 100% ON)
+    if(led_intensity >= (MAX_LED_INTENSITY * 0.9))
+    {
+      // Wait for a given delay in order to let the power measurements to settle
+      if(heatTimeDelay < ((unsigned long)BOILER_TESTING_DELAY_S * 1000UL))
+      {
+        heatTimeDelay += dT;
+      } else {
+        // When the delay has been executed, check if the boiler is consuming power...
+        if ( IsBoilerON() )
+        {
+          // It means it did not reach the desired temperature so we need to power it during the night for heating up
+          newMode = MODES_FORCE_HEAT;
+          heatTimeDelay = 0;
+        }
+        else 
+        {
+          // Otherwise we had enough sun during the day to get the required temperature in the boiler, so switching everything off for the whole night !
+          newMode = MODES_OFF;
+          heatTimeDelay = 0;
+        }
+      }
+    }
     break;
-    case MODES_NIGHT_HEAT :
-		// This Night heat mode is to make the boiler heat during the night because it did not have enough time/power to heat up to the required temperature
+    case MODES_FORCE_HEAT :
+    // This Force heat mode is to force the boiler to heat (mostly during the night because it did not have enough time/power to heat up to the required temperature, but can also be activated manually)
 
-		CurrentModeStr = "NIGHT_HEAT";
+    CurrentModeStr = "FORCE_HEAT";
 
-		// Switching the boiler ON to max power (still using the rate limiter to genlty switch it ON)
-		on_off_rate_lim.Update(MAX_LED_INTENSITY, dT);
-		led_intensity = on_off_rate_lim.GetOutput();
+    // Switching the boiler ON to max power (still using the rate limiter to genlty switch it ON)
+    on_off_rate_lim.Update(MAX_LED_INTENSITY, dT);
+    led_intensity = on_off_rate_lim.GetOutput();
 
-		// Smart mode : once the boiler is no longer consuming power it means it's hot enough, so...
-		if ( BoilerPower < MAX_BOILER_POWER / 3.0 )
-		{
-			// ...let's switch it OFF, and go to sleep
-			newMode = MODES_NIGHT_OFF;
-		}
+    // Smart mode : once the boiler is no longer consuming power it means it's hot enough, so...
+    if ( BoilerPower < MAX_BOILER_POWER / 3.0 )
+    {
+      // ...let's switch it OFF, and go to sleep
+      newMode = MODES_OFF;
+
+      // Remember when we had to do a forced heat (for display purpose)
+      LastForcedHeatDate = now;
+    }
     break;
-    case MODES_NIGHT_OFF :
-		// This Night off is a mode in which we switch the boiler off for the night
+    case MODES_OFF :
+    // This Off mode is a mode in which we switch the boiler off (mostly when at night)
 
-		CurrentModeStr = "NIGHT_OFF";
+    CurrentModeStr = "OFF";
 
-		// Switch the boiler OFF using the rate limiter to switch it off progressively
-		on_off_rate_lim.Update(0, dT);
-		led_intensity = on_off_rate_lim.GetOutput();
+    // Switch the boiler OFF using the rate limiter to switch it off progressively
+    on_off_rate_lim.Update(0, dT);
+    led_intensity = on_off_rate_lim.GetOutput();
     break;
     default :
-		// In IDLE mode and all unknown modes, switch the power off
-		on_off_rate_lim.Update(0, dT);
-		led_intensity = on_off_rate_lim.GetOutput();
+    // In IDLE mode and all unknown modes, switch the power off
+    on_off_rate_lim.Update(0, dT);
+    led_intensity = on_off_rate_lim.GetOutput();
     break;
   }
 
@@ -426,8 +468,10 @@ enum Menus ManageMenus( enum Menus menuToDisplay )
     
     unsigned long int curMillis = millis();
 
+    bool buttonChanged = button1.IsButtonStateChanged() || button2.IsButtonStateChanged() || button3.IsButtonStateChanged() || button4.IsButtonStateChanged();
+
     // Should we refresh the screen ?
-    if(menuToDisplay != prevMenu || (lastDisplayTime + (MENUS_REFRESH_TIME_S * 1000) <= curMillis) )
+    if(menuToDisplay != prevMenu || (lastDisplayTime + (MENUS_REFRESH_TIME_S * 1000) <= curMillis) || buttonChanged )
     {
         // Clear LCD
         lcd.clear();
@@ -436,89 +480,137 @@ enum Menus ManageMenus( enum Menus menuToDisplay )
         switch(menuToDisplay)
         {
             case MENU_1 :
-				// In this menu we successively display the variables of the Menu1_Vars
-				// They will scroll so that we can see them all
-				
-				// If reaching the end of the list, restart to the beginning
-				if((curVars + 1) >= sizeof(Menu1_Vars) / sizeof(Menu1_Vars[0]))
-				{
-				  curVars = 0;
-				}
-
-				// Define what's displayed in the two LCD lines
-				LCD_LINE(line1, "%s=%d%s", Menu1_Vars[curVars].VarName, (int)(*Menu1_Vars[curVars].VarPtr), Menu1_Vars[curVars].Unit);
-				LCD_LINE(line2, "%s=%d%s", Menu1_Vars[curVars+1].VarName, (int)(*Menu1_Vars[curVars+1].VarPtr), Menu1_Vars[curVars+1].Unit);
-				
-				// Move on to the next variables to display for the next refresh event
-				curVars++;
-            break;
-            case MENU_2 :
-				// Display the current mode
-				LCD_LINE(line1, "CurrentModeStr ");
-				LCD_LINE(line2, "%s", CurrentModeStr.c_str());
-            break;
-            case MENU_3 :
-				// Display sunrise and sunset times
-				riseSecs = sunrise_sunset_dates.SunriseDate.second();
-				riseMins = sunrise_sunset_dates.SunriseDate.minute();
-				riseHs = sunrise_sunset_dates.SunriseDate.hour();
-				LCD_LINE(line1, "sunrise:%u:%u", riseHs, riseMins);
-
-				SunSecs = sunrise_sunset_dates.SunsetDate.second();
-				SunMins = sunrise_sunset_dates.SunsetDate.minute();
-				SunHs = sunrise_sunset_dates.SunsetDate.hour();
-				SunTime = SunHs + ":"+ SunMins;
-				LCD_LINE(line2, "sunset:%u:%u", SunHs, SunMins );
-
-            break;
-                
-			case MENU_PARAMETERS :
-
-				// If reaching the end of the list, restart to the beginning
-				if(curVars >= sizeof(MenuParam_Vars) / sizeof(MenuParam_Vars[0]))
-				{
-				  curVars = 0;
-				}
-
-				// Displaying the probes average
-				LCD_LINE(line1, "Parameters");
-				LCD_LINE(line2, "%s=%d%s", MenuParam_Vars[curVars].VarName, (*(int*)MenuParam_Vars[curVars].VarPtr), MenuParam_Vars[curVars].Unit);
-
-				// Move on to the next variables to display for the next refresh event
-				curVars++;
-			break;
-            // For all other menus...
-            default :
-				// Switch of the LCD
-				switchOffLCD = true;
-				menuToDisplay = MENU_OFF;
-
-				// Resetting the probes average
-				for(int i = 0;i < CUR_SENSE_COUNT;i++)
-				{
-				  emonAvg[i] = 0;
-				  emonAvgTmp[i] = 0;
-				}
-				AvgCount = 0;
-				break;
-		}
-
-		if(switchOffLCD == true)
-		{
-			lcd.noBacklight(); // Switch the LCD backlight OFF
-		} else {
-			// Finally print the computed text to the LCD
-			lcd.backlight();
-			lcd.setCursor(0, 0);
-			lcd.print(line1);
-			lcd.setCursor(0, 1);
-			lcd.print(line2);
+        // In this menu we successively display the variables of the Menu1_Vars
+        // They will scroll so that we can see them all
+        
+        // If reaching the end of the list, restart to the beginning
+        if((curVars + 1) >= sizeof(Menu1_Vars) / sizeof(Menu1_Vars[0]))
+        {
+          curVars = 0;
         }
 
-    	lastDisplayTime = curMillis;
+        // Define what's displayed in the two LCD lines
+        ComputeLCDText(line1, Menu1_Vars[curVars]);
+        ComputeLCDText(line2, Menu1_Vars[curVars+1]);
+        
+        // Move on to the next variables to display for the next refresh event
+        curVars++;
+            break;
+            case MENU_2 :
+        // Display the current mode
+        LCD_LINE(line1, "CurrentModeStr ");
+        LCD_LINE(line2, "%s", CurrentModeStr.c_str());
+            break;
+            case MENU_3 :
+        // Display sunrise and sunset times
+        riseSecs = sunrise_sunset_dates.SunriseDate.second();
+        riseMins = sunrise_sunset_dates.SunriseDate.minute();
+        riseHs = sunrise_sunset_dates.SunriseDate.hour();
+        LCD_LINE(line1, "sunrise:%02d:%02d", riseHs, riseMins);
+
+        SunSecs = sunrise_sunset_dates.SunsetDate.second();
+        SunMins = sunrise_sunset_dates.SunsetDate.minute();
+        SunHs = sunrise_sunset_dates.SunsetDate.hour();
+        SunTime = SunHs + ":"+ SunMins;
+        LCD_LINE(line2, "sunset:%02d:%02d", SunHs, SunMins );
+
+            break;
+
+            case MENU_4 :
+            LCD_LINE(line1, "MENU4");
+            LCD_LINE(line2, "Nothing here...");
+        //LCD_LINE(line1, "passé par  ");
+        //LCD_LINE(line2, "%s", ModeAff.c_str());  
+        //dayMins = now.minute();
+        //dayHours = now.hour();
+        //dayD = now.day();
+        //dayM = now.month();
+        
+        /*LCD_LINE(line1, "end night heat on");
+        LCD_LINE(line2, "%u/%u  %u:%u", dayD, dayM,dayHours,dayMins );*/
+            break;
+            
+                
+      case MENU_PARAMETERS :
+
+        // If reaching the end of the list, restart to the beginning
+        if(curVars >= sizeof(MenuParam_Vars) / sizeof(MenuParam_Vars[0]))
+        {
+          curVars = 0;
+        }
+
+        // Displaying the probes average
+        LCD_LINE(line1, "Parameters");
+        ComputeLCDText(line2, MenuParam_Vars[curVars]);
+
+        // Move on to the next variables to display for the next refresh event
+        curVars++;
+      break;
+
+      case MENU_FORCE_HEAT:
+        // This menu is to allow the user to manually force the boiler to heat
+        static unsigned long int buttonPressedTime = 0;
+
+        // If coming here from another menu...
+        if(menuToDisplay != prevMenu)
+        {
+          // Reset some variables
+          buttonPressedTime = 0;
+        }
+      
+        LCD_LINE(line1, "Force heating ?");
+
+        if(button1.IsButtonPressed())
+        {
+          buttonPressedTime = curMillis;
+        }
+
+        if(buttonPressedTime == 0)
+        {
+          LCD_LINE(line2, "Long press if OK");
+        } else {
+          if((curMillis - buttonPressedTime) < 5000U)
+          {
+            LCD_LINE(line2, "Pressed...");
+          } else {
+            LCD_LINE(line2, "Going to forced");
+            currentMode = MODES_STARTING_FORCED_HEAT;
+          }
+        }
+      
+      break;
+            // For all other menus...
+            default :
+        // Switch of the LCD
+        switchOffLCD = true;
+        menuToDisplay = MENU_OFF;
+
+        // Resetting the probes average
+        for(int i = 0;i < CUR_SENSE_COUNT;i++)
+        {
+          emonAvg[i] = 0;
+          emonAvgTmp[i] = 0;
+        }
+        AvgCount = 0;
+        break;
+    }
+
+    if(switchOffLCD == true)
+    {
+      lcd.noBacklight(); // Switch the LCD backlight OFF
+    } else {
+      // Finally print the computed text to the LCD
+      lcd.backlight();
+      lcd.setCursor(0, 0);
+      lcd.print(line1);
+      lcd.setCursor(0, 1);
+      lcd.print(line2);
+        }
+
+      lastDisplayTime = curMillis;
     }
     
-	// Keep track of the previous menu
+  // Keep track of the previous menu
     prevMenu = menuToDisplay;
 
   return menuToDisplay;
@@ -576,18 +668,19 @@ void UpdateDateTime()
     {
       DateTime prevDate = DateTime(now);
       now = rtc.now();
-
-   	  Serial.println("Updating time");
- 
+      
+      #ifdef SERIAL_DEBUG
+      Serial.println("Updating time");
+      #endif
 
       // Did the day change ?
       if(now.day() != prevDate.day() || firstPass)
       {
-		// Update sunrise/sunset dates
+    // Update sunrise/sunset dates
         sunrise_sunset_dates = CalculateSunriseSunset(LOCAL_LATTITUDE, LOCAL_LONGITUDE, now, LOCAL_TIMEZONE(now));
       }
 
-	  // Computing Unix time
+    // Computing Unix time
       uint32_t sunriseUnixTime = sunrise_sunset_dates.SunriseDate.unixtime();
       uint32_t sunsetUnixTime = sunrise_sunset_dates.SunsetDate.unixtime();
 
@@ -596,14 +689,18 @@ void UpdateDateTime()
       {
         // Wake up ! Go to day heat mode
         currentMode = MODES_DAY_HEAT;
+        #ifdef SERIAL_DEBUG
         Serial.println("MODES_DAY_HEAT");
+        #endif
       } else {
         // If we just passed the sunset time
         if((now.unixtime() >= sunsetUnixTime && prevDate.unixtime() < sunsetUnixTime) || firstPass)
         {
-          // Go to starting night mode
-          currentMode = MODES_STARTING_NIGHT;
-          Serial.println("MODES_STARTING_NIGHT");
+          // Go to starting night mode (i.e. check if the boiler is hot enough and if not, force heating)
+          currentMode = MODES_STARTING_FORCED_HEAT;
+          #ifdef SERIAL_DEBUG
+          Serial.println("MODES_STARTING_FORCED_HEAT");
+          #endif
         }
       }
     } else {
